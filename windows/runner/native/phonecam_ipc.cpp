@@ -1,14 +1,76 @@
 #include "phonecam_ipc.h"
 #include <wincodec.h>
+#include <shellapi.h>
+#include <strmif.h>
+#include <uuids.h>
 #include <iostream>
 
 #pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "strmiids.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
 
 static HANDLE g_hSharedMem = NULL;
 static PhoneCamFrameHeader* g_pHeader = NULL;
 static uint8_t* g_pFrameData = NULL;
 static HANDLE g_hMutex = NULL;
 static IWICImagingFactory* g_pWicFactory = NULL;
+static IUnknown* g_pVirtualCameraObj = NULL;
+
+typedef enum _MFVirtualCameraType {
+    MFVirtualCameraType_SoftwareCamera = 0
+} MFVirtualCameraType;
+
+typedef enum _MFVirtualCameraLifetime {
+    MFVirtualCameraLifetime_Session = 0,
+    MFVirtualCameraLifetime_System = 1
+} MFVirtualCameraLifetime;
+
+typedef enum _MFVirtualCameraAccess {
+    MFVirtualCameraAccess_CurrentUser = 0,
+    MFVirtualCameraAccess_AllUsers = 1
+} MFVirtualCameraAccess;
+
+typedef HRESULT(STDAPICALLTYPE* PFN_MFCreateVirtualCamera)(
+    MFVirtualCameraType type,
+    MFVirtualCameraLifetime lifetime,
+    MFVirtualCameraAccess access,
+    LPCWSTR friendlyName,
+    LPCWSTR szCLSID,
+    LPCWSTR categories,
+    IUnknown** ppVirtualCamera
+);
+
+static bool RegisterMFVirtualCamera() {
+    HMODULE hMfPlat = LoadLibraryW(L"mfplat.dll");
+    if (!hMfPlat) return false;
+
+    PFN_MFCreateVirtualCamera pfnCreateVirCam = (PFN_MFCreateVirtualCamera)GetProcAddress(hMfPlat, "MFCreateVirtualCamera");
+    if (pfnCreateVirCam != NULL) {
+        if (g_pVirtualCameraObj) {
+            g_pVirtualCameraObj->Release();
+            g_pVirtualCameraObj = NULL;
+        }
+
+        HRESULT hr = pfnCreateVirCam(
+            MFVirtualCameraType_SoftwareCamera,
+            MFVirtualCameraLifetime_System,
+            MFVirtualCameraAccess_AllUsers,
+            L"PhoneCam",
+            L"{B98E711A-4C23-400A-9B3B-8F0E4632F1A2}",
+            NULL,
+            &g_pVirtualCameraObj
+        );
+
+        if (SUCCEEDED(hr) && g_pVirtualCameraObj != NULL) {
+            FreeLibrary(hMfPlat);
+            return true;
+        }
+    }
+
+    FreeLibrary(hMfPlat);
+    return false;
+}
 
 static bool InitializeIPC() {
     if (g_pHeader != NULL) return true;
@@ -175,7 +237,8 @@ extern "C" __declspec(dllexport) bool PhoneCam_WriteFrame(
 
 extern "C" __declspec(dllexport) bool PhoneCam_IsFilterRegistered() {
     HKEY hKey = NULL;
-    // 1. Check HKCR
+
+    // 1. Check HKCR System-Wide Registration
     const wchar_t* subKeyHKCR = L"CLSID\\{860BB310-5D01-11d0-BD3B-00A0C911CE86}\\Instance\\{B98E711A-4C23-400A-9B3B-8F0E4632F1A2}";
     LONG result = RegOpenKeyExW(HKEY_CLASSES_ROOT, subKeyHKCR, 0, KEY_READ, &hKey);
     if (result == ERROR_SUCCESS) {
@@ -183,9 +246,9 @@ extern "C" __declspec(dllexport) bool PhoneCam_IsFilterRegistered() {
         return true;
     }
 
-    // 2. Check HKCU
-    const wchar_t* subKeyHKCU = L"Software\\Classes\\CLSID\\{860BB310-5D01-11d0-BD3B-00A0C911CE86}\\Instance\\{B98E711A-4C23-400A-9B3B-8F0E4632F1A2}";
-    result = RegOpenKeyExW(HKEY_CURRENT_USER, subKeyHKCU, 0, KEY_READ, &hKey);
+    // 2. Check HKLM System-Wide Registration
+    const wchar_t* subKeyHKLM = L"SOFTWARE\\Classes\\CLSID\\{860BB310-5D01-11d0-BD3B-00A0C911CE86}\\Instance\\{B98E711A-4C23-400A-9B3B-8F0E4632F1A2}";
+    result = RegOpenKeyExW(HKEY_LOCAL_MACHINE, subKeyHKLM, 0, KEY_READ, &hKey);
     if (result == ERROR_SUCCESS) {
         RegCloseKey(hKey);
         return true;
@@ -194,36 +257,128 @@ extern "C" __declspec(dllexport) bool PhoneCam_IsFilterRegistered() {
     return false;
 }
 
-extern "C" __declspec(dllexport) bool PhoneCam_RegisterFilter(const wchar_t* dllPath) {
-    HMODULE hDll = LoadLibraryW(dllPath);
-    if (hDll == NULL) return false;
+extern "C" __declspec(dllexport) bool PhoneCam_DiagnoseDirectShow() {
+    CoInitialize(NULL);
+    ICreateDevEnum* pDevEnum = NULL;
+    HRESULT hr = CoCreateInstance(
+        CLSID_SystemDeviceEnum,
+        NULL,
+        CLSCTX_INPROC_SERVER,
+        IID_ICreateDevEnum,
+        (void**)&pDevEnum
+    );
 
-    typedef HRESULT(STDAPICALLTYPE * DllRegisterServerFn)();
-    DllRegisterServerFn pfnRegister = (DllRegisterServerFn)GetProcAddress(hDll, "DllRegisterServer");
+    if (FAILED(hr) || !pDevEnum) return false;
 
-    bool success = false;
-    if (pfnRegister != NULL) {
-        HRESULT hr = pfnRegister();
-        success = SUCCEEDED(hr);
+    IEnumMoniker* pEnum = NULL;
+    hr = pDevEnum->CreateClassEnumerator(CLSID_VideoInputDeviceCategory, &pEnum, 0);
+    pDevEnum->Release();
+
+    if (hr != S_OK || !pEnum) return false;
+
+    IMoniker* pMoniker = NULL;
+    bool found = false;
+
+    while (pEnum->Next(1, &pMoniker, NULL) == S_OK) {
+        IPropertyBag* pPropBag = NULL;
+        hr = pMoniker->BindToStorage(0, 0, IID_IPropertyBag, (void**)&pPropBag);
+        if (SUCCEEDED(hr)) {
+            VARIANT var;
+            VariantInit(&var);
+            hr = pPropBag->Read(L"FriendlyName", &var, 0);
+            if (SUCCEEDED(hr) && var.vt == VT_BSTR && var.bstrVal) {
+                if (wcsstr(var.bstrVal, L"PhoneCam") != NULL) {
+                    // Instantiation Check: BindToObject creates the filter instance
+                    IBaseFilter* pFilter = NULL;
+                    hr = pMoniker->BindToObject(0, 0, IID_IBaseFilter, (void**)&pFilter);
+                    if (SUCCEEDED(hr) && pFilter) {
+                        found = true;
+                        pFilter->Release();
+                    }
+                }
+            }
+            VariantClear(&var);
+            pPropBag->Release();
+        }
+        pMoniker->Release();
+        if (found) break;
     }
 
-    FreeLibrary(hDll);
-    return success;
+    pEnum->Release();
+    return found;
+}
+
+extern "C" __declspec(dllexport) bool PhoneCam_RegisterFilter(const wchar_t* dllPath) {
+    if (!dllPath || wcslen(dllPath) == 0) return false;
+
+    // Register Media Foundation Virtual Camera for Windows 11 / Windows 10
+    RegisterMFVirtualCamera();
+
+    // 1. Try in-process LoadLibrary DllRegisterServer
+    HMODULE hDll = LoadLibraryW(dllPath);
+    if (hDll != NULL) {
+        typedef HRESULT(STDAPICALLTYPE * DllRegisterServerFn)();
+        DllRegisterServerFn pfnRegister = (DllRegisterServerFn)GetProcAddress(hDll, "DllRegisterServer");
+        if (pfnRegister != NULL) {
+            HRESULT hr = pfnRegister();
+            FreeLibrary(hDll);
+            if (SUCCEEDED(hr) && PhoneCam_IsFilterRegistered()) {
+                return true;
+            }
+        } else {
+            FreeLibrary(hDll);
+        }
+    }
+
+    // 2. Execute elevated regsvr32 via ShellExecuteW 'runas' for Administrator System Registration
+    wchar_t params[MAX_PATH + 20];
+    wsprintfW(params, L"/s \"%s\"", dllPath);
+
+    SHELLEXECUTEINFOW sei = { sizeof(sei) };
+    sei.cbSize = sizeof(sei);
+    sei.lpVerb = L"runas";
+    sei.lpFile = L"regsvr32.exe";
+    sei.lpParameters = params;
+    sei.nShow = SW_HIDE;
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+
+    if (ShellExecuteExW(&sei) && sei.hProcess) {
+        WaitForSingleObject(sei.hProcess, 10000);
+        CloseHandle(sei.hProcess);
+    }
+
+    // 3. GENUINELY VERIFY actual registration in system registry!
+    return PhoneCam_IsFilterRegistered();
 }
 
 extern "C" __declspec(dllexport) bool PhoneCam_UnregisterFilter(const wchar_t* dllPath) {
+    if (!dllPath || wcslen(dllPath) == 0) return false;
+
     HMODULE hDll = LoadLibraryW(dllPath);
-    if (hDll == NULL) return false;
-
-    typedef HRESULT(STDAPICALLTYPE * DllUnregisterServerFn)();
-    DllUnregisterServerFn pfnUnregister = (DllUnregisterServerFn)GetProcAddress(hDll, "DllUnregisterServer");
-
-    bool success = false;
-    if (pfnUnregister != NULL) {
-        HRESULT hr = pfnUnregister();
-        success = SUCCEEDED(hr);
+    if (hDll != NULL) {
+        typedef HRESULT(STDAPICALLTYPE * DllUnregisterServerFn)();
+        DllUnregisterServerFn pfnUnregister = (DllUnregisterServerFn)GetProcAddress(hDll, "DllUnregisterServer");
+        if (pfnUnregister != NULL) {
+            pfnUnregister();
+        }
+        FreeLibrary(hDll);
     }
 
-    FreeLibrary(hDll);
-    return success;
+    wchar_t params[MAX_PATH + 20];
+    wsprintfW(params, L"/u /s \"%s\"", dllPath);
+
+    SHELLEXECUTEINFOW sei = { sizeof(sei) };
+    sei.cbSize = sizeof(sei);
+    sei.lpVerb = L"runas";
+    sei.lpFile = L"regsvr32.exe";
+    sei.lpParameters = params;
+    sei.nShow = SW_HIDE;
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+
+    if (ShellExecuteExW(&sei) && sei.hProcess) {
+        WaitForSingleObject(sei.hProcess, 10000);
+        CloseHandle(sei.hProcess);
+    }
+
+    return !PhoneCam_IsFilterRegistered();
 }

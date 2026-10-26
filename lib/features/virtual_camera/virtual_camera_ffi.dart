@@ -21,6 +21,9 @@ typedef DartWriteFrame = int Function(
 typedef NativeIsFilterRegistered = Uint8 Function();
 typedef DartIsFilterRegistered = int Function();
 
+typedef NativeDiagnoseDirectShow = Uint8 Function();
+typedef DartDiagnoseDirectShow = int Function();
+
 typedef NativeRegisterFilter = Uint8 Function(Pointer<Utf16> dllPath);
 typedef DartRegisterFilter = int Function(Pointer<Utf16> dllPath);
 
@@ -31,6 +34,7 @@ class VirtualCameraFFI {
   static DynamicLibrary? _lib;
   static DartWriteFrame? _writeFrame;
   static DartIsFilterRegistered? _isFilterRegistered;
+  static DartDiagnoseDirectShow? _diagnoseDirectShow;
   static DartRegisterFilter? _registerFilter;
   static DartUnregisterFilter? _unregisterFilter;
 
@@ -42,6 +46,7 @@ class VirtualCameraFFI {
 
       _writeFrame = _lib?.lookupFunction<NativeWriteFrame, DartWriteFrame>('PhoneCam_WriteFrame');
       _isFilterRegistered = _lib?.lookupFunction<NativeIsFilterRegistered, DartIsFilterRegistered>('PhoneCam_IsFilterRegistered');
+      _diagnoseDirectShow = _lib?.lookupFunction<NativeDiagnoseDirectShow, DartDiagnoseDirectShow>('PhoneCam_DiagnoseDirectShow');
       _registerFilter = _lib?.lookupFunction<NativeRegisterFilter, DartRegisterFilter>('PhoneCam_RegisterFilter');
       _unregisterFilter = _lib?.lookupFunction<NativeUnregisterFilter, DartUnregisterFilter>('PhoneCam_UnregisterFilter');
     } catch (e) {
@@ -64,7 +69,12 @@ class VirtualCameraFFI {
 
   static bool isFilterRegistered() {
     if (_isFilterRegistered == null || !Platform.isWindows) return false;
-    return _isFilterRegistered!() != 0;
+    final isReg = _isFilterRegistered!() != 0;
+    if (!isReg) return false;
+    if (_diagnoseDirectShow != null) {
+      return _diagnoseDirectShow!() != 0;
+    }
+    return isReg;
   }
 
   static bool registerFilter(String dllPath) {

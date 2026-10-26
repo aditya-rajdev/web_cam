@@ -37,3 +37,11 @@ target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(PhoneCamFilter PRIVATE "strmiids.lib" "advapi32.lib" "ole32.lib" "oleaut32.lib" "user32.lib" "gdi32.lib" "windowscodecs.lib")
 
 add_dependencies(${BINARY_NAME} flutter_assemble)
+
+# Automated Code-Signing for all compiled Windows EXEs and DLLs to satisfy Windows Smart App Control
+if(WIN32)
+  add_custom_command(TARGET ${BINARY_NAME} POST_BUILD
+    COMMAND powershell -ExecutionPolicy Bypass -Command "Start-Sleep -Milliseconds 500; Get-ChildItem -Path '${CMAKE_BINARY_DIR}' -Include '*.dll','*.exe' -Recurse -ErrorAction SilentlyContinue | ForEach-Object { $cert = Get-ChildItem Cert:\\LocalMachine\\My | Where-Object { $_.Subject -like '*PhoneCam Local Development*' } | Select-Object -First 1; if ($cert) { Set-AuthenticodeSignature -FilePath $_.FullName -Certificate $cert -ErrorAction SilentlyContinue } }"
+    COMMENT "Signing compiled Windows EXE and DLL binaries with Local Development Certificate..."
+  )
+endif()

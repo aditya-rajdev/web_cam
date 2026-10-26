@@ -4,30 +4,74 @@
 #include <strmif.h>
 #include <uuids.h>
 #include <vfwmsgs.h>
-#include <amvideo.h>
-#include <olectl.h>
-#include <ks.h>
-#include <ksmedia.h>
 #include <stdint.h>
-#include "phonecam_ipc.h"
+
+#ifndef VFW_E_NOT_CONNECTED
+#define VFW_E_NOT_CONNECTED ((HRESULT)0x80040209L)
+#endif
 
 #ifndef E_PROP_SET_UNSUPPORTED
 #define E_PROP_SET_UNSUPPORTED ((HRESULT)0x80070490L)
 #endif
 
+typedef struct tagRECT_CAM {
+    LONG left;
+    LONG top;
+    LONG right;
+    LONG bottom;
+} RECT_CAM;
+
+typedef struct tagBITMAPINFOHEADER_CAM {
+    DWORD biSize;
+    LONG biWidth;
+    LONG biHeight;
+    WORD biPlanes;
+    WORD biBitCount;
+    DWORD biCompression;
+    DWORD biSizeImage;
+    LONG biXPelsPerMeter;
+    LONG biYPelsPerMeter;
+    DWORD biClrUsed;
+    DWORD biClrImportant;
+} BITMAPINFOHEADER_CAM;
+
+typedef struct tagVIDEOINFOHEADER_CAM {
+    RECT_CAM rcSource;
+    RECT_CAM rcTarget;
+    DWORD dwBitRate;
+    DWORD dwBitErrorRate;
+    REFERENCE_TIME AvgTimePerFrame;
+    BITMAPINFOHEADER_CAM bmiHeader;
+} VIDEOINFOHEADER_CAM;
+
+// DirectShow GUIDs
 // CLSID_PhoneCamFilter: {B98E711A-4C23-400A-9B3B-8F0E4632F1A2}
 static const GUID CLSID_PhoneCamFilter =
 { 0xb98e711a, 0x4c23, 0x400a, { 0x9b, 0x3b, 0x8f, 0x0e, 0x46, 0x32, 0xf1, 0xa2 } };
 
-// PIN_CATEGORY_CAPTURE: {FB6C4281-0353-11d1-905F-0000C0420070}
-static const GUID CLSID_PIN_CATEGORY_CAPTURE =
-{ 0xfb6c4281, 0x0353, 0x11d1, { 0x90, 0x5f, 0x00, 0x00, 0xc0, 0x42, 0x00, 0x70 } };
+#define FILTER_NAME L"PhoneCam"
+#define CLSID_STRING L"{B98E711A-4C23-400A-9B3B-8F0E4632F1A2}"
 
-static const wchar_t* FILTER_NAME = L"PhoneCam";
-static const wchar_t* CLSID_STRING = L"{B98E711A-4C23-400A-9B3B-8F0E4632F1A2}";
+#define PHONECAM_MAGIC 0x5043414D
+#define PHONECAM_SHM_NAME L"Local\\PhoneCamSharedMem"
+#define PHONECAM_MUTEX_NAME L"Local\\PhoneCamFrameMutex"
+#define PHONECAM_MAX_BUF_SIZE (1920 * 1080 * 3 + 1024)
 
-static HMODULE g_hModule = NULL;
+#pragma pack(push, 1)
+struct PhoneCamFrameHeader {
+    uint32_t magic;
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;
+    uint32_t sequenceNumber;
+    uint64_t timestampMs;
+    uint32_t payloadSize;
+    uint32_t isConnected;
+};
+#pragma pack(pop)
+
 static LONG g_cRefModule = 0;
+static HINSTANCE g_hModule = NULL;
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
@@ -38,14 +82,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 }
 
 class CPhoneCamFilter;
-class CPhoneCamOutputPin;
 
-// DirectShow EnumMediaTypes
 class CPhoneCamEnumMediaTypes : public IEnumMediaTypes {
     LONG m_cRef;
     ULONG m_iIndex;
 public:
     CPhoneCamEnumMediaTypes() : m_cRef(1), m_iIndex(0) {}
+    virtual ~CPhoneCamEnumMediaTypes() {}
 
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) {
         if (!ppv) return E_POINTER;
@@ -74,7 +117,6 @@ public:
 
         AM_MEDIA_TYPE* pmt = (AM_MEDIA_TYPE*)CoTaskMemAlloc(sizeof(AM_MEDIA_TYPE));
         ZeroMemory(pmt, sizeof(AM_MEDIA_TYPE));
-
         pmt->majortype = MEDIATYPE_Video;
         pmt->subtype = MEDIASUBTYPE_RGB24;
         pmt->bFixedSizeSamples = TRUE;
@@ -82,10 +124,10 @@ public:
         pmt->lSampleSize = 1280 * 720 * 3;
         pmt->formattype = FORMAT_VideoInfo;
 
-        VIDEOINFOHEADER* pvih = (VIDEOINFOHEADER*)CoTaskMemAlloc(sizeof(VIDEOINFOHEADER));
-        ZeroMemory(pvih, sizeof(VIDEOINFOHEADER));
+        VIDEOINFOHEADER_CAM* pvih = (VIDEOINFOHEADER_CAM*)CoTaskMemAlloc(sizeof(VIDEOINFOHEADER_CAM));
+        ZeroMemory(pvih, sizeof(VIDEOINFOHEADER_CAM));
         pvih->AvgTimePerFrame = 333333; // 30 FPS
-        pvih->bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        pvih->bmiHeader.biSize = sizeof(BITMAPINFOHEADER_CAM);
         pvih->bmiHeader.biWidth = 1280;
         pvih->bmiHeader.biHeight = 720;
         pvih->bmiHeader.biPlanes = 1;
@@ -93,8 +135,8 @@ public:
         pvih->bmiHeader.biCompression = BI_RGB;
         pvih->bmiHeader.biSizeImage = 1280 * 720 * 3;
 
+        pmt->cbFormat = sizeof(VIDEOINFOHEADER_CAM);
         pmt->pbFormat = (BYTE*)pvih;
-        pmt->cbFormat = sizeof(VIDEOINFOHEADER);
 
         ppMediaTypes[0] = pmt;
         m_iIndex++;
@@ -107,18 +149,15 @@ public:
         return (m_iIndex <= 1) ? S_OK : S_FALSE;
     }
 
-    STDMETHODIMP Reset() { m_iIndex = 0; return S_OK; }
-    STDMETHODIMP Clone(IEnumMediaTypes** ppEnum) {
-        if (!ppEnum) return E_POINTER;
-        CPhoneCamEnumMediaTypes* pNew = new CPhoneCamEnumMediaTypes();
-        pNew->m_iIndex = m_iIndex;
-        *ppEnum = pNew;
+    STDMETHODIMP Reset() {
+        m_iIndex = 0;
         return S_OK;
     }
+
+    STDMETHODIMP Clone(IEnumMediaTypes** ppEnum) { return E_NOTIMPL; }
 };
 
-// DirectShow Output Pin
-class CPhoneCamOutputPin : public IPin, public IKsPropertySet {
+class CPhoneCamOutputPin : public IPin, public IAMStreamConfig, public IKsPropertySet {
     LONG m_cRef;
     CPhoneCamFilter* m_pFilter;
     IPin* m_pConnectedPin;
@@ -127,21 +166,24 @@ class CPhoneCamOutputPin : public IPin, public IKsPropertySet {
     HANDLE m_hStreamThread;
     bool m_bStreaming;
     uint64_t m_frameCount;
-
-    static DWORD WINAPI StreamThreadProc(LPVOID lpParam);
-    void DoStreamLoop();
-
 public:
     CPhoneCamOutputPin(CPhoneCamFilter* pFilter);
-    ~CPhoneCamOutputPin();
+    virtual ~CPhoneCamOutputPin();
 
     void StartStreaming();
     void StopStreaming();
+    static DWORD WINAPI StreamThreadProc(LPVOID lpParam);
+    void DoStreamLoop();
 
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) {
         if (!ppv) return E_POINTER;
         if (riid == IID_IUnknown || riid == IID_IPin) {
             *ppv = static_cast<IPin*>(this);
+            AddRef();
+            return S_OK;
+        }
+        if (riid == IID_IAMStreamConfig) {
+            *ppv = static_cast<IAMStreamConfig*>(this);
             AddRef();
             return S_OK;
         }
@@ -161,6 +203,7 @@ public:
         return res;
     }
 
+    // IPin Methods
     STDMETHODIMP Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* pmt) {
         if (!pReceivePin) return E_POINTER;
         m_pConnectedPin = pReceivePin;
@@ -253,37 +296,128 @@ public:
     STDMETHODIMP EndFlush() { return S_OK; }
     STDMETHODIMP NewSegment(REFERENCE_TIME tStart, REFERENCE_TIME tStop, double dRate) { return S_OK; }
 
+    // IAMStreamConfig Methods
+    STDMETHODIMP SetFormat(AM_MEDIA_TYPE *pmt) { return S_OK; }
+    STDMETHODIMP GetFormat(AM_MEDIA_TYPE **ppmt) {
+        if (!ppmt) return E_POINTER;
+        AM_MEDIA_TYPE* pmt = (AM_MEDIA_TYPE*)CoTaskMemAlloc(sizeof(AM_MEDIA_TYPE));
+        ZeroMemory(pmt, sizeof(AM_MEDIA_TYPE));
+        pmt->majortype = MEDIATYPE_Video;
+        pmt->subtype = MEDIASUBTYPE_RGB24;
+        pmt->bFixedSizeSamples = TRUE;
+        pmt->bTemporalCompression = FALSE;
+        pmt->lSampleSize = 1280 * 720 * 3;
+        pmt->formattype = FORMAT_VideoInfo;
+
+        VIDEOINFOHEADER_CAM* pvih = (VIDEOINFOHEADER_CAM*)CoTaskMemAlloc(sizeof(VIDEOINFOHEADER_CAM));
+        ZeroMemory(pvih, sizeof(VIDEOINFOHEADER_CAM));
+        pvih->AvgTimePerFrame = 333333; // 30 FPS
+        pvih->bmiHeader.biSize = sizeof(BITMAPINFOHEADER_CAM);
+        pvih->bmiHeader.biWidth = 1280;
+        pvih->bmiHeader.biHeight = 720;
+        pvih->bmiHeader.biPlanes = 1;
+        pvih->bmiHeader.biBitCount = 24;
+        pvih->bmiHeader.biCompression = BI_RGB;
+        pvih->bmiHeader.biSizeImage = 1280 * 720 * 3;
+
+        pmt->cbFormat = sizeof(VIDEOINFOHEADER_CAM);
+        pmt->pbFormat = (BYTE*)pvih;
+
+        *ppmt = pmt;
+        return S_OK;
+    }
+
+    STDMETHODIMP GetNumberOfCapabilities(int *piCount, int *piSize) {
+        if (!piCount || !piSize) return E_POINTER;
+        *piCount = 1;
+        *piSize = sizeof(VIDEO_STREAM_CONFIG_CAPS);
+        return S_OK;
+    }
+
+    STDMETHODIMP GetStreamCaps(int iIndex, AM_MEDIA_TYPE **ppmt, BYTE *pSCC) {
+        if (iIndex != 0) return E_INVALIDARG;
+        if (!ppmt || !pSCC) return E_POINTER;
+
+        AM_MEDIA_TYPE* pmt = (AM_MEDIA_TYPE*)CoTaskMemAlloc(sizeof(AM_MEDIA_TYPE));
+        ZeroMemory(pmt, sizeof(AM_MEDIA_TYPE));
+        pmt->majortype = MEDIATYPE_Video;
+        pmt->subtype = MEDIASUBTYPE_RGB24;
+        pmt->bFixedSizeSamples = TRUE;
+        pmt->bTemporalCompression = FALSE;
+        pmt->lSampleSize = 1280 * 720 * 3;
+        pmt->formattype = FORMAT_VideoInfo;
+
+        VIDEOINFOHEADER_CAM* pvih = (VIDEOINFOHEADER_CAM*)CoTaskMemAlloc(sizeof(VIDEOINFOHEADER_CAM));
+        ZeroMemory(pvih, sizeof(VIDEOINFOHEADER_CAM));
+        pvih->AvgTimePerFrame = 333333; // 30 FPS
+        pvih->bmiHeader.biSize = sizeof(BITMAPINFOHEADER_CAM);
+        pvih->bmiHeader.biWidth = 1280;
+        pvih->bmiHeader.biHeight = 720;
+        pvih->bmiHeader.biPlanes = 1;
+        pvih->bmiHeader.biBitCount = 24;
+        pvih->bmiHeader.biCompression = BI_RGB;
+        pvih->bmiHeader.biSizeImage = 1280 * 720 * 3;
+
+        pmt->cbFormat = sizeof(VIDEOINFOHEADER_CAM);
+        pmt->pbFormat = (BYTE*)pvih;
+
+        *ppmt = pmt;
+
+        VIDEO_STREAM_CONFIG_CAPS* pCaps = (VIDEO_STREAM_CONFIG_CAPS*)pSCC;
+        ZeroMemory(pCaps, sizeof(VIDEO_STREAM_CONFIG_CAPS));
+        pCaps->guid = MEDIATYPE_Video;
+        pCaps->VideoStandard = 0;
+        pCaps->InputSize.cx = 1280;
+        pCaps->InputSize.cy = 720;
+        pCaps->MinCroppingSize.cx = 1280;
+        pCaps->MinCroppingSize.cy = 720;
+        pCaps->MaxCroppingSize.cx = 1280;
+        pCaps->MaxCroppingSize.cy = 720;
+        pCaps->MinOutputSize.cx = 1280;
+        pCaps->MinOutputSize.cy = 720;
+        pCaps->MaxOutputSize.cx = 1280;
+        pCaps->MaxOutputSize.cy = 720;
+        pCaps->MinFrameInterval = 333333;
+        pCaps->MaxFrameInterval = 333333;
+        pCaps->MinBitsPerSecond = 1280 * 720 * 24 * 30;
+        pCaps->MaxBitsPerSecond = 1280 * 720 * 24 * 30;
+
+        return S_OK;
+    }
+
+    // IKsPropertySet Methods
     STDMETHODIMP Set(REFGUID guidPropSet, DWORD dwPropID, LPVOID pInstanceData, DWORD cbInstanceData, LPVOID pPropData, DWORD cbPropData) {
         return E_NOTIMPL;
     }
 
-    STDMETHODIMP Get(REFGUID guidPropSet, DWORD dwPropID, LPVOID pInstanceData, DWORD cbInstanceData, LPVOID pPropData, DWORD cbPropData, DWORD* ppcbReturned) {
-        if (guidPropSet == AMPROPSETID_Pin && dwPropID == AMPROPERTY_PIN_CATEGORY) {
-            if (pPropData && cbPropData >= sizeof(GUID)) {
-                *(GUID*)pPropData = CLSID_PIN_CATEGORY_CAPTURE;
-                if (ppcbReturned) *ppcbReturned = sizeof(GUID);
+    STDMETHODIMP Get(REFGUID guidPropSet, DWORD dwPropID, LPVOID pInstanceData, DWORD cbInstanceData, LPVOID pPropData, DWORD cbPropData, DWORD *pcbReturned) {
+        if (guidPropSet == AMPROPSETID_Pin) {
+            if (dwPropID == 0) { // AMPROPERTY_PIN_CATEGORY
+                if (pPropData == NULL || cbPropData < sizeof(GUID)) return E_INVALIDARG;
+                *(GUID*)pPropData = PIN_CATEGORY_CAPTURE;
+                if (pcbReturned) *pcbReturned = sizeof(GUID);
                 return S_OK;
             }
         }
         return E_PROP_SET_UNSUPPORTED;
     }
 
-    STDMETHODIMP QuerySupported(REFGUID guidPropSet, DWORD dwPropID, DWORD* pTypeSupport) {
-        if (guidPropSet == AMPROPSETID_Pin && dwPropID == AMPROPERTY_PIN_CATEGORY) {
-            if (pTypeSupport) *pTypeSupport = KSPROPERTY_SUPPORT_GET;
+    STDMETHODIMP QuerySupported(REFGUID guidPropSet, DWORD dwPropID, DWORD *pTypeSupport) {
+        if (guidPropSet == AMPROPSETID_Pin && dwPropID == 0) {
+            if (pTypeSupport) *pTypeSupport = 1; // KSPROPERTY_SUPPORT_GET
             return S_OK;
         }
         return E_PROP_SET_UNSUPPORTED;
     }
 };
 
-// DirectShow EnumPins
 class CPhoneCamEnumPins : public IEnumPins {
     LONG m_cRef;
     ULONG m_iIndex;
     CPhoneCamFilter* m_pFilter;
 public:
     CPhoneCamEnumPins(CPhoneCamFilter* pFilter);
+    virtual ~CPhoneCamEnumPins() {}
 
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) {
         if (!ppv) return E_POINTER;
@@ -309,7 +443,6 @@ public:
     STDMETHODIMP Clone(IEnumPins** ppEnum) { return E_NOTIMPL; }
 };
 
-// DirectShow Source Filter Implementation
 class CPhoneCamFilter : public IBaseFilter {
     LONG m_cRef;
     FILTER_STATE m_state;
@@ -480,11 +613,11 @@ void CPhoneCamOutputPin::DoStreamLoop() {
                 if (hMutex) ReleaseMutex(hMutex);
 
                 if (!hasFrame) {
-                    // Fill dark blue standby background pattern
+                    // Fill dark standby background pattern
                     for (ULONG i = 0; i < frameSize; i += 3) {
-                        pData[i] = 60;     // B
-                        pData[i + 1] = 30; // G
-                        pData[i + 2] = 20; // R
+                        pData[i] = 40;     // B
+                        pData[i + 1] = 20; // G
+                        pData[i + 2] = 15; // R
                     }
                 }
             }
@@ -523,7 +656,6 @@ STDMETHODIMP CPhoneCamEnumPins::Next(ULONG cPins, IPin** ppPins, ULONG* pcFetche
     return S_OK;
 }
 
-// Class Factory
 class CPhoneCamClassFactory : public IClassFactory {
     LONG m_cRef;
 public:
@@ -566,7 +698,19 @@ public:
 static bool RegisterKey(HKEY rootKey, const wchar_t* subKey, const wchar_t* valueName, const wchar_t* data) {
     HKEY hKey = NULL;
     if (RegCreateKeyExW(rootKey, subKey, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-        RegSetValueExW(hKey, valueName, 0, REG_SZ, (BYTE*)data, (lstrlenW(data) + 1) * sizeof(wchar_t));
+        if (data != NULL) {
+            RegSetValueExW(hKey, valueName, 0, REG_SZ, (BYTE*)data, (lstrlenW(data) + 1) * sizeof(wchar_t));
+        }
+        RegCloseKey(hKey);
+        return true;
+    }
+    return false;
+}
+
+static bool RegisterBinaryKey(HKEY rootKey, const wchar_t* subKey, const wchar_t* valueName, const BYTE* pData, DWORD cbData) {
+    HKEY hKey = NULL;
+    if (RegCreateKeyExW(rootKey, subKey, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        RegSetValueExW(hKey, valueName, 0, REG_BINARY, pData, cbData);
         RegCloseKey(hKey);
         return true;
     }
@@ -582,25 +726,46 @@ STDAPI DllRegisterServer() {
     if (GetModuleFileNameW(g_hModule, szModule, MAX_PATH) == 0) return E_FAIL;
 
     wchar_t szSubKey[MAX_PATH];
-    HKEY rootKey = HKEY_CLASSES_ROOT;
 
+    // Require HKLM System-Wide Administrator Registration
+    HKEY rootKey = HKEY_LOCAL_MACHINE;
     HKEY hTestKey = NULL;
-    if (RegOpenKeyExW(HKEY_CLASSES_ROOT, L"CLSID", 0, KEY_WRITE, &hTestKey) == ERROR_SUCCESS) {
-        RegCloseKey(hTestKey);
-    } else {
-        rootKey = HKEY_CURRENT_USER;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Classes\\CLSID", 0, KEY_WRITE, &hTestKey) != ERROR_SUCCESS) {
+        // Return E_ACCESSDENIED if process is not running as Administrator
+        return E_ACCESSDENIED;
     }
+    RegCloseKey(hTestKey);
 
-    const wchar_t* prefix = (rootKey == HKEY_CURRENT_USER) ? L"Software\\Classes\\" : L"";
-
-    wsprintfW(szSubKey, L"%sCLSID\\%s", prefix, CLSID_STRING);
+    // 1. DirectShow CLSID Registration
+    wsprintfW(szSubKey, L"SOFTWARE\\Classes\\CLSID\\%s", CLSID_STRING);
     RegisterKey(rootKey, szSubKey, NULL, FILTER_NAME);
 
-    wsprintfW(szSubKey, L"%sCLSID\\%s\\InprocServer32", prefix, CLSID_STRING);
+    wsprintfW(szSubKey, L"SOFTWARE\\Classes\\CLSID\\%s\\InprocServer32", CLSID_STRING);
     RegisterKey(rootKey, szSubKey, NULL, szModule);
     RegisterKey(rootKey, szSubKey, L"ThreadingModel", L"Both");
 
-    wsprintfW(szSubKey, L"%sCLSID\\{860BB310-5D01-11d0-BD3B-00A0C911CE86}\\Instance\\%s", prefix, CLSID_STRING);
+    // 2. DirectShow Video Input Device Category (System-Wide with Pin Metadata)
+    wsprintfW(szSubKey, L"SOFTWARE\\Classes\\CLSID\\{860BB310-5D01-11d0-BD3B-00A0C911CE86}\\Instance\\%s", CLSID_STRING);
+    RegisterKey(rootKey, szSubKey, L"FriendlyName", FILTER_NAME);
+    RegisterKey(rootKey, szSubKey, L"CLSID", CLSID_STRING);
+
+    static const BYTE filterData[] = {
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x33, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    RegisterBinaryKey(rootKey, szSubKey, L"FilterData", filterData, sizeof(filterData));
+
+    // 3. Media Foundation Platform Registration (64-bit and 32-bit WOW64)
+    wsprintfW(szSubKey, L"SOFTWARE\\Microsoft\\Windows Media Foundation\\Platform\\%s", CLSID_STRING);
+    RegisterKey(rootKey, szSubKey, L"FriendlyName", FILTER_NAME);
+    RegisterKey(rootKey, szSubKey, L"CLSID", CLSID_STRING);
+
+    wsprintfW(szSubKey, L"SOFTWARE\\WOW6432Node\\Microsoft\\Windows Media Foundation\\Platform\\%s", CLSID_STRING);
     RegisterKey(rootKey, szSubKey, L"FriendlyName", FILTER_NAME);
     RegisterKey(rootKey, szSubKey, L"CLSID", CLSID_STRING);
 
@@ -610,19 +775,22 @@ STDAPI DllRegisterServer() {
 STDAPI DllUnregisterServer() {
     wchar_t szSubKey[MAX_PATH];
 
-    HKEY roots[2] = { HKEY_CLASSES_ROOT, HKEY_CURRENT_USER };
-    for (int i = 0; i < 2; i++) {
-        const wchar_t* prefix = (roots[i] == HKEY_CURRENT_USER) ? L"Software\\Classes\\" : L"";
+    HKEY rootKey = HKEY_LOCAL_MACHINE;
 
-        wsprintfW(szSubKey, L"%sCLSID\\{860BB310-5D01-11d0-BD3B-00A0C911CE86}\\Instance\\%s", prefix, CLSID_STRING);
-        DeleteKey(roots[i], szSubKey);
+    wsprintfW(szSubKey, L"SOFTWARE\\Classes\\CLSID\\{860BB310-5D01-11d0-BD3B-00A0C911CE86}\\Instance\\%s", CLSID_STRING);
+    DeleteKey(rootKey, szSubKey);
 
-        wsprintfW(szSubKey, L"%sCLSID\\%s\\InprocServer32", prefix, CLSID_STRING);
-        DeleteKey(roots[i], szSubKey);
+    wsprintfW(szSubKey, L"SOFTWARE\\Classes\\CLSID\\%s\\InprocServer32", CLSID_STRING);
+    DeleteKey(rootKey, szSubKey);
 
-        wsprintfW(szSubKey, L"%sCLSID\\%s", prefix, CLSID_STRING);
-        DeleteKey(roots[i], szSubKey);
-    }
+    wsprintfW(szSubKey, L"SOFTWARE\\Classes\\CLSID\\%s", CLSID_STRING);
+    DeleteKey(rootKey, szSubKey);
+
+    wsprintfW(szSubKey, L"SOFTWARE\\Microsoft\\Windows Media Foundation\\Platform\\%s", CLSID_STRING);
+    DeleteKey(rootKey, szSubKey);
+
+    wsprintfW(szSubKey, L"SOFTWARE\\WOW6432Node\\Microsoft\\Windows Media Foundation\\Platform\\%s", CLSID_STRING);
+    DeleteKey(rootKey, szSubKey);
 
     return S_OK;
 }

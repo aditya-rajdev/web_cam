@@ -29,6 +29,7 @@ extern "C" {
 
 __declspec(dllexport) bool PhoneCam_WriteFrame(uint32_t width, uint32_t height, const uint8_t* rgbData, uint32_t dataSize, uint32_t isConnected);
 __declspec(dllexport) bool PhoneCam_IsFilterRegistered();
+__declspec(dllexport) bool PhoneCam_DiagnoseDirectShow();
 __declspec(dllexport) bool PhoneCam_RegisterFilter(const wchar_t* dllPath);
 __declspec(dllexport) bool PhoneCam_UnregisterFilter(const wchar_t* dllPath);
 

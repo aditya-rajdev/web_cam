@@ -49,6 +49,8 @@ class _WindowsHomeScreenState extends State<WindowsHomeScreen> {
         setState(() {
           _currentFrameBytes = bytes;
         });
+        // Forward live video frame to Windows Virtual Camera shared memory IPC
+        VirtualCameraFFI.writeFrame(w, h, bytes, true);
       }
     };
 
@@ -59,6 +61,9 @@ class _WindowsHomeScreenState extends State<WindowsHomeScreen> {
           _errorType = errType;
           _isConnecting = false;
         });
+        if (!connected) {
+          VirtualCameraFFI.writeFrame(1280, 720, [], false);
+        }
         _log('State [${errType ?? "OK"}]: $msg');
       }
     };
@@ -83,7 +88,7 @@ class _WindowsHomeScreenState extends State<WindowsHomeScreen> {
     setState(() {
       _isVirtualCamRegistered = isRegistered;
     });
-    _log('Virtual Camera Filter COM status: ${isRegistered ? "REGISTERED (Ready for OBS/Meet/Zoom)" : "NOT REGISTERED"}');
+    _log('Virtual Camera Filter COM status: ${isRegistered ? "REGISTERED & VERIFIED IN SYSTEM REGISTRY (Ready for OBS/Meet/Zoom)" : "NOT REGISTERED"}');
   }
 
   Future<void> _checkAdbStatus() async {
@@ -144,6 +149,14 @@ class _WindowsHomeScreenState extends State<WindowsHomeScreen> {
       File dllFile = File('$exeDir\\PhoneCamFilter.dll');
 
       if (!dllFile.existsSync()) {
+        dllFile = File('${Directory.current.path}\\build\\windows\\x64\\runner\\Release\\PhoneCamFilter.dll');
+      }
+
+      if (!dllFile.existsSync()) {
+        dllFile = File('${Directory.current.path}\\build\\windows\\x64\\runner\\Debug\\PhoneCamFilter.dll');
+      }
+
+      if (!dllFile.existsSync()) {
         dllFile = File('${Directory.current.path}\\PhoneCamFilter.dll');
       }
 
@@ -152,18 +165,21 @@ class _WindowsHomeScreenState extends State<WindowsHomeScreen> {
         dllFile = File('${appDir.path}\\PhoneCamFilter.dll');
       }
 
-      _log('Registering DirectShow Filter DLL at: ${dllFile.path}');
+      _log('Registering DirectShow & Media Foundation Virtual Camera DLL at: ${dllFile.path}');
       final success = VirtualCameraFFI.registerFilter(dllFile.path);
       _checkVirtualCamStatus();
 
       if (!mounted) return;
-      if (success) {
-        _log('PhoneCam Virtual Camera filter successfully registered in system registry!');
+      if (success && _isVirtualCamRegistered) {
+        _log('PhoneCam Virtual Camera filter successfully registered and verified in System Registry!');
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('PhoneCam Virtual Camera registered! Select "PhoneCam" in OBS/Meet/Zoom/Teams.')),
         );
       } else {
-        _log('Filter registration failed. Try running register_virtual_cam.bat as Administrator.');
+        _log('Filter registration requires Administrator privileges. Try running scripts\\register_virtual_cam.bat as Administrator.');
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Administrator privileges required for system virtual camera registration.')),
+        );
         _showManualRegisterDialog();
       }
     } catch (e) {
@@ -296,6 +312,7 @@ class _WindowsHomeScreenState extends State<WindowsHomeScreen> {
       setState(() {
         _currentFrameBytes = null;
       });
+      VirtualCameraFFI.writeFrame(1280, 720, [], false);
     }
   }
 
@@ -732,7 +749,7 @@ class _WindowsHomeScreenState extends State<WindowsHomeScreen> {
                                   const SizedBox(width: 8),
                                   Text(
                                     'Advanced Diagnostics Log (${_diagnosticLogs.length} events)',
-                                    style: const TextStyle(color: AppColors.textPrimary, fontWeight: FontWeight.bold, fontSize: 13),
+                                    style: const TextStyle(color: AppColors.textPrimary, fontWeight: FontWeight.bold, fontSize: 12),
                                   ),
                                 ],
                               ),

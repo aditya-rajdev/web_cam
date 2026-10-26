@@ -3,16 +3,20 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
-import 'package:shared_preferences/shared_preferences.dart';
 import '../../../core/config/api_config.dart';
+import '../../../core/security/secure_storage_helper.dart';
 import '../models/auth_models.dart';
 
 class AuthApiService {
   static final AuthApiService instance = AuthApiService._internal();
   AuthApiService._internal();
 
+  static final _secureStorage = SecureStorageHelper.instance;
+
   static const String _accessTokenKey = 'phonecam_access_token';
   static const String _refreshTokenKey = 'phonecam_refresh_token';
+  static const String _userEmailKey = 'phonecam_user_email';
+  static const String _userNameKey = 'phonecam_user_name';
 
   String baseUrl = ApiConfig.baseUrl;
 
@@ -32,17 +36,38 @@ class AuthApiService {
         if (_accessToken != null) 'Authorization': 'Bearer $_accessToken',
       };
 
+  Future<void> _writeSecure({required String key, required String value}) async {
+    await _secureStorage.write(key: key, value: value);
+  }
+
+  Future<String?> _readSecure({required String key}) async {
+    return await _secureStorage.read(key: key);
+  }
+
+  Future<void> _deleteSecure({required String key}) async {
+    await _secureStorage.delete(key: key);
+  }
+
   Future<void> initialize() async {
     try {
-      final prefs = await SharedPreferences.getInstance();
-      _accessToken = prefs.getString(_accessTokenKey);
-      _refreshToken = prefs.getString(_refreshTokenKey);
+      _accessToken = await _readSecure(key: _accessTokenKey);
+      _refreshToken = await _readSecure(key: _refreshTokenKey);
+      final email = await _readSecure(key: _userEmailKey);
+      final name = await _readSecure(key: _userNameKey);
+
+      if (email != null && email.isNotEmpty) {
+        _currentUser = AuthUser(
+          id: 'usr_1',
+          email: email,
+          name: (name != null && name.isNotEmpty) ? name : email.split('@')[0],
+        );
+      }
 
       if (isAuthenticated) {
         await fetchUserProfile();
       }
     } catch (e) {
-      debugPrint('Error initializing AuthApiService: $e');
+      debugPrint('Error initializing AuthApiService session: $e');
     }
   }
 
@@ -264,12 +289,19 @@ class AuthApiService {
         _accessToken = data['access_token'] ?? data['token'];
         _refreshToken = data['refresh_token'];
 
-        final prefs = await SharedPreferences.getInstance();
         if (_accessToken != null) {
-          await prefs.setString(_accessTokenKey, _accessToken!);
+          await _writeSecure(key: _accessTokenKey, value: _accessToken!);
         }
         if (_refreshToken != null) {
-          await prefs.setString(_refreshTokenKey, _refreshToken!);
+          await _writeSecure(key: _refreshTokenKey, value: _refreshToken!);
+        }
+
+        await _writeSecure(key: _userEmailKey, value: cleanEmail);
+        if (name != null && name.isNotEmpty) {
+          await _writeSecure(key: _userNameKey, value: name);
+          _currentUser = AuthUser(id: 'usr_1', email: cleanEmail, name: name);
+        } else {
+          _currentUser = AuthUser(id: 'usr_1', email: cleanEmail, name: cleanEmail.split('@')[0]);
         }
 
         // Fetch user profile and entitlements ONLY AFTER successful OTP verification
@@ -306,10 +338,55 @@ class AuthApiService {
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
         _currentUser = AuthUser.fromJson(data);
+        if (_currentUser?.email.isNotEmpty == true) {
+          await _writeSecure(key: _userEmailKey, value: _currentUser!.email);
+          await _writeSecure(key: _userNameKey, value: _currentUser!.name);
+        }
+      } else if (response.statusCode == 401 || response.statusCode == 403) {
+        // Token is confirmed invalid/revoked by backend
+        if (_refreshToken != null && _refreshToken!.isNotEmpty) {
+          final refreshed = await attemptRefreshToken();
+          if (!refreshed) {
+            await logout();
+          }
+        } else {
+          await logout();
+        }
       }
+    } on SocketException catch (_) {
+      debugPrint('Network unavailable during profile check. Maintaining local authenticated session.');
     } catch (e) {
       debugPrint('Error fetching user profile: $e');
     }
+  }
+
+  Future<bool> attemptRefreshToken() async {
+    if (_refreshToken == null || _refreshToken!.isEmpty) return false;
+    try {
+      final response = await http
+          .post(
+            Uri.parse('$baseUrl/auth/refresh-token'),
+            headers: ApiConfig.defaultHeaders,
+            body: jsonEncode({'refresh_token': _refreshToken}),
+          )
+          .timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        _accessToken = data['access_token'] ?? data['token'];
+        if (data['refresh_token'] != null) {
+          _refreshToken = data['refresh_token'];
+          await _writeSecure(key: _refreshTokenKey, value: _refreshToken!);
+        }
+        if (_accessToken != null) {
+          await _writeSecure(key: _accessTokenKey, value: _accessToken!);
+          return true;
+        }
+      }
+    } catch (e) {
+      debugPrint('Error refreshing token: $e');
+    }
+    return false;
   }
 
   Future<Map<String, dynamic>?> fetchEntitlements() async {
@@ -369,8 +446,13 @@ class AuthApiService {
     _accessToken = null;
     _refreshToken = null;
     _currentUser = null;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_accessTokenKey);
-    await prefs.remove(_refreshTokenKey);
+    try {
+      await _deleteSecure(key: _accessTokenKey);
+      await _deleteSecure(key: _refreshTokenKey);
+      await _deleteSecure(key: _userEmailKey);
+      await _deleteSecure(key: _userNameKey);
+    } catch (e) {
+      debugPrint('Error clearing storage on logout: $e');
+    }
   }
 }
